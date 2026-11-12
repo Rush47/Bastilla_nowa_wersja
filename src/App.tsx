@@ -293,9 +293,12 @@ export function App() {
     setBusy(true);
     setError('');
     const currentAttachments = [...attachments];
-    setAttachments([]);
     try {
       const result = await api.sendMessage(sessionId, value, recipient, currentAttachments);
+      setText((current) => current.trim() === value ? '' : current);
+      setAttachments((current) => current.filter((attachment) =>
+        !currentAttachments.some((sent) => sent.id === attachment.id),
+      ));
       refreshOrder.current.invalidate();
       setSnapshot((current) =>
         current
@@ -324,7 +327,6 @@ export function App() {
     e?.preventDefault();
     const value = text.trim();
     if ((!value && attachments.length === 0) || busy || !sessionId) return;
-    setText('');
     await sendPromptText(value);
   };
 
@@ -1264,7 +1266,7 @@ export function App() {
                         {!health
                           ? 'Brak odczytu'
                           : health.geminiConfigured
-                          ? 'Skonfigurowany · gemini-3.8-flash'
+                          ? 'Skonfigurowany po stronie serwera'
                           : 'Nieskonfigurowany · brak GEMINI_API_KEY'}
                       </span>
                     </div>

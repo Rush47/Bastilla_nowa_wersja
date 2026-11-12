@@ -1,4 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
+import { chatContext, geminiModel } from './src/lib/chatContext';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import dotenv from 'dotenv';
@@ -15,6 +16,7 @@ import {
   parseCodexCliCommand,
   stripAnsiCodes,
 } from './src/lib/codexCliBridge';
+import { pickOllamaChatModel } from './src/kernel/llmChain';
 import { resolveVisionModel } from './src/kernel/visionModel';
 import { requireGitHubWriteToken } from './src/lib/githubWriteAuth';
 import { createFleetRouter } from './src/lib/fleetRoutes';
@@ -1313,7 +1315,13 @@ async function answerWithOllama(
   attachments?: ChatAttachmentPayload[],
 ): Promise<{ content: string; provider: string }> {
   const state = await checkOllamaStatus();
-  if (!state.reachable || !state.model) {
+  const hasImages = Boolean(attachments?.some((attachment) => attachment.mimeType.startsWith('image/')));
+  const model = hasImages
+    ? state.model
+    : state.models.includes(preferredOllamaModel)
+      ? preferredOllamaModel
+      : state.model || pickOllamaChatModel(state.models.map((name) => ({ name })));
+  if (!state.reachable || !model) {
     throw new Error(state.error || 'Demon Ollama nie odpowiada lub brak pobranego modelu.');
   }
   const images = (attachments || [])
@@ -1329,7 +1337,7 @@ async function answerWithOllama(
         content:
           'Jesteś systemowym asystentem Bastilla OS / SVL_System na Debian 13. Odpowiadaj konkretnie po polsku. Nie symuluj wykonanych operacji.',
       },
-      ...history.slice(-10).map((m) => ({
+      ...chatContext(history).map((m) => ({
         role: m.role === 'user' ? 'user' : 'assistant',
         content: m.content,
       })),
@@ -1342,14 +1350,14 @@ async function answerWithOllama(
     const r = await fetch(`${ollamaBaseUrl}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: state.model, stream: false, messages: messagesPayload }),
+      body: JSON.stringify({ model, stream: false, messages: messagesPayload }),
       signal: ctrl.signal,
     });
     if (!r.ok) throw new Error(`Ollama HTTP ${r.status}`);
     const body = (await r.json()) as { message?: { content?: string } };
     const content = body.message?.content?.trim();
     if (!content) throw new Error('Ollama zwróciła pustą odpowiedź.');
-    return { content, provider: `Ollama · ${state.model}` };
+    return { content, provider: `Ollama · ${model}` };
   } finally {
     clearTimeout(timer);
   }
@@ -1357,6 +1365,7 @@ async function answerWithOllama(
 
 async function answerWithGemini(
   input: string,
+  history: Message[],
   attachments?: ChatAttachmentPayload[],
 ): Promise<{ content: string; provider: string }> {
   const apiKey = (process.env.GEMINI_API_KEY || '').trim();
@@ -1389,10 +1398,16 @@ async function answerWithGemini(
       `Jeśli użytkownik prosi o wykres, tabelę lub kartę diagnostyczną, możesz dołączyć blok \`\`\`svl-ui {"components":[...]}\`\`\`.\n\nPolecenie użytkownika:\n${input}`,
   });
 
-  const modelName = 'gemini-3.8-flash';
+  const modelName = geminiModel();
   const response = await ai.models.generateContent({
     model: modelName,
-    contents: { parts },
+    contents: [
+      ...chatContext(history).map((message) => ({
+        role: message.role === 'user' ? 'user' : 'model',
+        parts: [{ text: message.content }],
+      })),
+      { role: 'user', parts },
+    ],
   });
   const text = (response.text || '').trim();
   if (!text) throw new Error('Gemini zwróciło pustą odpowiedź.');
@@ -1476,7 +1491,7 @@ async function answerNaturalLanguageCommand(
   } catch {
     // Next try server-side Gemini if configured
     try {
-      return await answerWithGemini(input, attachments);
+      return await answerWithGemini(input, history, attachments);
     } catch {
       // Fallback to deterministic SVL Kernel & system report
       const svl = getCurrentSvlCoreReport();
@@ -1580,7 +1595,7 @@ app.post('/api/messages', async (req, res) => {
         const { report, rawJson, pid } = await runPythonSvlCoreReport(process.cwd());
         const replyContent = await answerNaturalLanguageCommand(
           content,
-          db.messages.filter((m) => m.sessionId === sessionId && m.id !== ariaMsg.id),
+          db.messages.filter((m) => m.sessionId === sessionId && m.id !== ariaMsg.id && m.id !== userMsg.id),
           attachments,
         );
         ariaMsg.content = `${replyContent.content}\n\n---\n*SVL Core Telemetry (${report.System}, Compact_Metric_C=${report.Compact_Metric_C}, PID=${pid})*\n\`\`\`json\n${rawJson}\n\`\`\``;
@@ -1624,7 +1639,7 @@ app.post('/api/messages', async (req, res) => {
     });
   }
 
-  const sessionHistory = db.messages.filter((m) => m.sessionId === sessionId);
+  const sessionHistory = db.messages.filter((m) => m.sessionId === sessionId && m.id !== userMsg.id);
   const responseMessage: Message = {
     id: randomUUID(),
     sessionId,
